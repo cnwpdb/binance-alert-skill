@@ -14,13 +14,13 @@ BinanceAlert — openclaw 技能脚本
   python3 binance_alert.py status                         # 查看当前预警状态
 """
 
-import sys, os, json, time, hashlib, urllib.request, urllib.error, gzip, re
+import sys, os, json, time, hashlib, urllib.request, urllib.error, gzip, re, fcntl
 from pathlib import Path
 from datetime import datetime
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-ENV_FILE   = Path("/data/freqtrade/user_data/.secrets.env")
-STATE_FILE = Path("/data/freqtrade/user_data/binance_alert_state.json")
+ENV_FILE   = Path(os.getenv("BINANCE_ALERT_ENV_FILE", "/data/freqtrade/user_data/.secrets.env"))
+STATE_FILE = Path(os.getenv("BINANCE_ALERT_STATE_FILE", "/data/freqtrade/user_data/binance_alert_state.json"))
 BINANCE_API  = "https://api.binance.com"
 BINANCE_WEB3 = "https://web3.binance.com"
 BINANCE_CMS  = "https://www.binance.com"
@@ -29,6 +29,13 @@ BINANCE_CMS  = "https://www.binance.com"
 ALPHA_COOLDOWN_SEC        = 3600   # alpha 相同内容 1 小时内不重复推
 ALPHA_FORCE_INTERVAL_SEC  = 14400  # 即使内容变了，4 小时内最多推一次
 CHANGE_RESET_HOURS        = 24     # 涨跌幅预警触发后 24h 重置，可再次触发
+
+# 重试配置
+MAX_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 1.5
+
+# 允许的环境变量名格式（字母、数字、下划线）
+ENV_VAR_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
 def load_env():
@@ -39,8 +46,11 @@ def load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        if k.strip() not in os.environ:
-            os.environ[k.strip()] = v.strip().strip('"').strip("'")
+        k = k.strip()
+        if not ENV_VAR_PATTERN.match(k):
+            continue
+        if k not in os.environ:
+            os.environ[k] = v.strip().strip('"').strip("'")
 
 load_env()
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
@@ -49,25 +59,52 @@ TG_CHAT  = os.getenv("TG_CHAT_ID", "")
 
 # ── 工具 ──────────────────────────────────────────────────────────────────────
 def http_get(url, headers=None):
-    req = urllib.request.Request(url, headers=headers or {
+    headers = headers or {
         "User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"
-    })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        raw = r.read()
-        if r.info().get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-        return json.loads(raw)
+    }
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read()
+                if r.info().get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError(f"Expected dict response, got {type(data).__name__}")
+                return data
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = RETRY_BACKOFF_FACTOR ** attempt
+                time.sleep(sleep_time)
+    raise last_error or ValueError("HTTP request failed")
 
 def http_post(url, data):
     body = json.dumps(data).encode()
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json", "Accept-Encoding": "identity"
-    })
-    with urllib.request.urlopen(req, timeout=15) as r:
-        raw = r.read()
-        if r.info().get("Content-Encoding") == "gzip":
-            raw = gzip.decompress(raw)
-        return json.loads(raw)
+    headers = {
+        "Content-Type": "application/json", "Accept-Encoding": "identity",
+        "User-Agent": "Mozilla/5.0"
+    }
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read()
+                if r.info().get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                result = json.loads(raw)
+                if not isinstance(result, dict):
+                    raise ValueError(f"Expected dict response, got {type(result).__name__}")
+                return result
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                sleep_time = RETRY_BACKOFF_FACTOR ** attempt
+                time.sleep(sleep_time)
+    raise last_error or ValueError("HTTP request failed")
 
 def tg_send(text):
     if not TG_TOKEN or not TG_CHAT:
@@ -88,12 +125,7 @@ def now_ts():
     return int(time.time())
 
 def load_state():
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            pass
-    return {
+    state = {
         "price_alerts": [],
         "change_alerts": [],
         "known_symbols": [],
@@ -102,9 +134,34 @@ def load_state():
         "alpha_last_sent_ts": 0,
         "last_check": {}
     }
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                try:
+                    state = json.loads(f.read())
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+    return state
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = STATE_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_file, "w") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(state, ensure_ascii=False, indent=2))
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        temp_file.replace(STATE_FILE)
+    except Exception:
+        if temp_file.exists():
+            temp_file.unlink()
+        raise
 
 def out(data):
     print(json.dumps(data, ensure_ascii=False, indent=2))
